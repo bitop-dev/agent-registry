@@ -19,6 +19,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:9080", "listen address")
 	pluginRoot := flag.String("plugin-root", "../agent-plugins", "path to plugin package root")
 	dataDir := flag.String("data-dir", "./data", "path to generated registry data")
+	publishToken := flag.String("publish-token", "", "bearer token required to publish packages (empty = publish disabled)")
 	jsonLog := flag.Bool("json-log", true, "emit logs as JSON (set false for human-readable text)")
 	flag.Parse()
 
@@ -79,13 +80,19 @@ func main() {
 	}
 	slog.Info("artifacts ready", "count", len(artifacts))
 
-	handler := httpapi.New("official", packages, artifacts)
+	handler := httpapi.New("official", packages, artifacts, httpapi.ServerOptions{
+		DataDir:      absDataDir,
+		BaseURL:      baseURL,
+		PublishToken: *publishToken,
+	})
 
+	publishEnabled := *publishToken != ""
 	slog.Info("server ready",
 		"addr", *addr,
 		"base_url", baseURL,
 		"plugin_root", absPluginRoot,
 		"packages", len(packages),
+		"publish_enabled", publishEnabled,
 		"startup_ms", time.Since(startedAt).Milliseconds(),
 		"endpoints", []string{
 			baseURL + "/healthz",

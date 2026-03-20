@@ -101,6 +101,12 @@ func build(rec source.PackageRecord, target string) error {
 }
 
 func sha256File(path string) (string, error) {
+	return SHA256File(path)
+}
+
+// SHA256File computes the hex-encoded SHA256 checksum of a file.
+// Exported for use by the publish handler.
+func SHA256File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err

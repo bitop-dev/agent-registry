@@ -1,7 +1,10 @@
 package source
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -89,6 +92,46 @@ func toRecord(path string, mf manifest) (PackageRecord, error) {
 		Path:        path,
 		Keywords:    unique(baseKeywords),
 	}, nil
+}
+
+// ScanTarball reads a plugin .tar.gz and extracts metadata from its plugin.yaml.
+// The tarball must contain a top-level directory with a plugin.yaml inside.
+func ScanTarball(path string) (PackageRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return PackageRecord{}, err
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return PackageRecord{}, fmt.Errorf("not a valid gzip file: %w", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return PackageRecord{}, err
+		}
+		// Look for a plugin.yaml at exactly one directory level deep.
+		parts := strings.SplitN(filepath.ToSlash(hdr.Name), "/", 3)
+		if len(parts) != 2 || parts[1] != "plugin.yaml" {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return PackageRecord{}, err
+		}
+		var mf manifest
+		if err := yaml.Unmarshal(data, &mf); err != nil {
+			return PackageRecord{}, fmt.Errorf("parse plugin.yaml: %w", err)
+		}
+		return toRecord(path, mf)
+	}
+	return PackageRecord{}, fmt.Errorf("plugin.yaml not found in tarball")
 }
 
 func unique(values []string) []string {

@@ -3,10 +3,14 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/ncecere/agent-registry/internal/archive"
 	"github.com/ncecere/agent-registry/internal/index"
@@ -20,18 +24,31 @@ import (
 var safeNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]*[a-z0-9]$`)
 
 type Server struct {
-	SourceName string
-	Packages   []source.PackageRecord
-	Artifacts  map[string]archive.Artifact
+	SourceName   string
+	DataDir      string
+	BaseURL      string
+	PublishToken string // empty = publish disabled
+
+	mu        sync.RWMutex
+	packages  []source.PackageRecord
+	artifacts map[string]archive.Artifact
 }
 
 // New returns an http.Handler with all registry routes registered and
 // wrapped in structured-logging middleware.
-func New(sourceName string, packages []source.PackageRecord, artifacts map[string]archive.Artifact) http.Handler {
-	s := &Server{SourceName: sourceName, Packages: packages, Artifacts: artifacts}
+func New(sourceName string, packages []source.PackageRecord, artifacts map[string]archive.Artifact, opts ServerOptions) http.Handler {
+	s := &Server{
+		SourceName:   sourceName,
+		DataDir:      opts.DataDir,
+		BaseURL:      opts.BaseURL,
+		PublishToken: opts.PublishToken,
+		packages:     packages,
+		artifacts:    artifacts,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/index.json", s.handleIndex)
+	mux.HandleFunc("/v1/packages", s.handlePublish) // POST only
 	mux.HandleFunc("/v1/packages/", s.handlePackages)
 	mux.HandleFunc("/artifacts/", s.handleArtifacts)
 	mux.Handle("/metrics", metrics.Handler())
@@ -40,16 +57,141 @@ func New(sourceName string, packages []source.PackageRecord, artifacts map[strin
 	return middleware.Logging(mux)
 }
 
+// ServerOptions holds optional configuration for the HTTP server.
+type ServerOptions struct {
+	DataDir      string
+	BaseURL      string
+	PublishToken string // if empty, publish endpoint is disabled
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "endpoint", "health")
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	s.mu.RLock()
+	count := len(s.packages)
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "packages": count})
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "endpoint", "index")
-	middleware.AddField(r.Context(), "package_count", len(s.Packages))
+	s.mu.RLock()
+	pkgs := s.packages
+	s.mu.RUnlock()
+	middleware.AddField(r.Context(), "package_count", len(pkgs))
 	metrics.RecordIndexRequest()
-	writeJSON(w, http.StatusOK, index.BuildSearchIndex(s.Packages, s.SourceName))
+	writeJSON(w, http.StatusOK, index.BuildSearchIndex(pkgs, s.SourceName))
+}
+
+// handlePublish accepts POST /v1/packages with a raw .tar.gz body.
+// Requires Authorization: Bearer <token> if PublishToken is configured.
+func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
+	middleware.AddField(r.Context(), "endpoint", "publish")
+
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.PublishToken == "" {
+		writeError(w, http.StatusForbidden, "publish is disabled on this registry")
+		return
+	}
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if auth != s.PublishToken {
+		middleware.AddField(r.Context(), "error", "unauthorized")
+		writeError(w, http.StatusUnauthorized, "invalid publish token")
+		return
+	}
+	if s.DataDir == "" {
+		writeError(w, http.StatusInternalServerError, "registry data-dir not configured")
+		return
+	}
+
+	// Stream body to a temp file.
+	tmp, err := os.CreateTemp("", "agent-registry-publish-*.tar.gz")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create temp file")
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, r.Body); err != nil {
+		tmp.Close()
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	tmp.Close()
+
+	// Extract plugin.yaml from the tarball to get name/version.
+	rec, err := source.ScanTarball(tmp.Name())
+	if err != nil {
+		middleware.AddField(r.Context(), "error", err.Error())
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid plugin tarball: %v", err))
+		return
+	}
+	middleware.AddField(r.Context(), "package", rec.Name)
+	middleware.AddField(r.Context(), "version", rec.Version)
+
+	// Store the tarball at data/artifacts/<name>/<version>.tar.gz.
+	artifactPath := filepath.Join(s.DataDir, "artifacts", rec.Name, rec.Version+".tar.gz")
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create artifact dir")
+		return
+	}
+	if err := os.Rename(tmp.Name(), artifactPath); err != nil {
+		// Rename may fail across filesystems; fall back to copy.
+		if err2 := copyFile(tmp.Name(), artifactPath); err2 != nil {
+			writeError(w, http.StatusInternalServerError, "failed to store artifact")
+			return
+		}
+	}
+
+	checksum, err := archive.SHA256File(artifactPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to compute checksum")
+		return
+	}
+	art := archive.Artifact{
+		Type:   "tar.gz",
+		URL:    strings.TrimRight(s.BaseURL, "/") + "/artifacts/" + rec.Name + "/" + rec.Version + ".tar.gz",
+		SHA256: checksum,
+		Path:   artifactPath,
+	}
+	rec.Path = artifactPath // published packages reference the artifact path
+
+	// Update in-memory registry under write lock.
+	s.mu.Lock()
+	// Replace existing record for this name+version or append.
+	replaced := false
+	for i, p := range s.packages {
+		if p.Name == rec.Name {
+			s.packages[i] = rec
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.packages = append(s.packages, rec)
+	}
+	s.artifacts[rec.Name+"@"+rec.Version] = art
+	s.mu.Unlock()
+
+	metrics.SetPackagesLoaded(len(s.packages))
+	middleware.AddField(r.Context(), "replaced", replaced)
+	writeJSON(w, http.StatusCreated, index.BuildVersionManifest(rec, art))
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
@@ -143,11 +285,13 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lookup(name string) (source.PackageRecord, archive.Artifact, error) {
-	for _, rec := range s.Packages {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, rec := range s.packages {
 		if rec.Name != name {
 			continue
 		}
-		art, ok := s.Artifacts[rec.Name+"@"+rec.Version]
+		art, ok := s.artifacts[rec.Name+"@"+rec.Version]
 		if !ok {
 			return source.PackageRecord{}, archive.Artifact{}, errors.New("artifact missing")
 		}
@@ -181,3 +325,7 @@ func WarmArtifacts(packages []source.PackageRecord, dataDir, baseURL string) (ma
 func EnsureDataDir(path string) error {
 	return os.MkdirAll(path, 0o755)
 }
+
+// SHA256File computes the hex SHA256 of a file — exposed for use in publish handler.
+// The real implementation is in archive but re-exported here for convenience.
+var _ = archive.SHA256File // ensure it's accessible
