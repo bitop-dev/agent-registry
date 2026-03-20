@@ -1,4 +1,4 @@
-module github.com/ncecere/agent-registry
+module github.com/bitop-dev/agent-registry
 
 go 1.24.0
 

@@ -12,11 +12,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ncecere/agent-registry/internal/archive"
-	"github.com/ncecere/agent-registry/internal/index"
-	"github.com/ncecere/agent-registry/internal/metrics"
-	"github.com/ncecere/agent-registry/internal/middleware"
-	"github.com/ncecere/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/archive"
+	"github.com/bitop-dev/agent-registry/internal/index"
+	"github.com/bitop-dev/agent-registry/internal/metrics"
+	"github.com/bitop-dev/agent-registry/internal/middleware"
+	"github.com/bitop-dev/agent-registry/internal/source"
 )
 
 // safeNameRe matches valid package names: lowercase letters, digits, hyphens.

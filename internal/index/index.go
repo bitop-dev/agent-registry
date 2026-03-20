@@ -3,8 +3,8 @@ package index
 import (
 	"time"
 
-	"github.com/ncecere/agent-registry/internal/archive"
-	"github.com/ncecere/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/archive"
+	"github.com/bitop-dev/agent-registry/internal/source"
 )
 
 const APIVersion = "agent.registry/v1"

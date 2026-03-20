@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/ncecere/agent-registry/internal/httpapi"
-	"github.com/ncecere/agent-registry/internal/metrics"
-	"github.com/ncecere/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/httpapi"
+	"github.com/bitop-dev/agent-registry/internal/metrics"
+	"github.com/bitop-dev/agent-registry/internal/source"
 )
 
 func main() {

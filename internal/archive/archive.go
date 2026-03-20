@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncecere/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/source"
 )
 
 type Artifact struct {

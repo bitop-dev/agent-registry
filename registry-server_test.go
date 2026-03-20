@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ncecere/agent-registry/internal/httpapi"
-	"github.com/ncecere/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/httpapi"
+	"github.com/bitop-dev/agent-registry/internal/source"
 )
 
 func TestServerHealthAndIndex(t *testing.T) {

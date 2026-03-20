@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ncecere/agent-registry/internal/metrics"
+	"github.com/bitop-dev/agent-registry/internal/metrics"
 )
 
 type ctxKey struct{}
