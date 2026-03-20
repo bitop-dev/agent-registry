@@ -1,0 +1,96 @@
+package index
+
+import (
+	"time"
+
+	"github.com/ncecere/agent-registry/internal/archive"
+	"github.com/ncecere/agent-registry/internal/source"
+)
+
+const APIVersion = "agent.registry/v1"
+
+type SearchIndex struct {
+	APIVersion  string         `json:"apiVersion"`
+	GeneratedAt time.Time      `json:"generatedAt"`
+	Packages    []IndexPackage `json:"packages"`
+}
+
+type IndexPackage struct {
+	Name          string   `json:"name"`
+	LatestVersion string   `json:"latestVersion"`
+	Description   string   `json:"description"`
+	Category      string   `json:"category"`
+	Runtime       string   `json:"runtime"`
+	Keywords      []string `json:"keywords"`
+	Source        string   `json:"source"`
+}
+
+type PackageMetadata struct {
+	APIVersion  string           `json:"apiVersion"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Versions    []VersionSummary `json:"versions"`
+}
+
+type VersionSummary struct {
+	Version   string           `json:"version"`
+	Framework string           `json:"framework"`
+	Runtime   string           `json:"runtime"`
+	Artifact  archive.Artifact `json:"artifact"`
+}
+
+type VersionManifest struct {
+	APIVersion   string            `json:"apiVersion"`
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	Description  string            `json:"description"`
+	Framework    string            `json:"framework"`
+	Runtime      string            `json:"runtime"`
+	Artifact     archive.Artifact  `json:"artifact"`
+	InstallHints map[string]string `json:"installHints,omitempty"`
+}
+
+func BuildSearchIndex(packages []source.PackageRecord, sourceName string) SearchIndex {
+	out := SearchIndex{APIVersion: APIVersion, GeneratedAt: time.Now().UTC()}
+	for _, rec := range packages {
+		out.Packages = append(out.Packages, IndexPackage{
+			Name:          rec.Name,
+			LatestVersion: rec.Version,
+			Description:   rec.Description,
+			Category:      rec.Category,
+			Runtime:       rec.Runtime,
+			Keywords:      rec.Keywords,
+			Source:        sourceName,
+		})
+	}
+	return out
+}
+
+func BuildPackageMetadata(rec source.PackageRecord, art archive.Artifact) PackageMetadata {
+	return PackageMetadata{
+		APIVersion:  APIVersion,
+		Name:        rec.Name,
+		Description: rec.Description,
+		Versions: []VersionSummary{{
+			Version:   rec.Version,
+			Framework: rec.Framework,
+			Runtime:   rec.Runtime,
+			Artifact:  art,
+		}},
+	}
+}
+
+func BuildVersionManifest(rec source.PackageRecord, art archive.Artifact) VersionManifest {
+	return VersionManifest{
+		APIVersion:  APIVersion,
+		Name:        rec.Name,
+		Version:     rec.Version,
+		Description: rec.Description,
+		Framework:   rec.Framework,
+		Runtime:     rec.Runtime,
+		Artifact:    art,
+		InstallHints: map[string]string{
+			"runtime": "Install runtime dependencies separately if this plugin uses external services, CLIs, or MCP servers.",
+		},
+	}
+}
