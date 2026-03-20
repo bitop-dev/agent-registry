@@ -16,11 +16,11 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:9080", "listen address")
-	pluginRoot := flag.String("plugin-root", "../agent-plugins", "path to plugin package root")
-	dataDir := flag.String("data-dir", "./data", "path to generated registry data")
+	addr         := flag.String("addr", "127.0.0.1:9080", "listen address")
+	pluginRoot   := flag.String("plugin-root", "../agent-plugins", "path to plugin package root (also scanned for profile packages)")
+	dataDir      := flag.String("data-dir", "./data", "path to generated registry data")
 	publishToken := flag.String("publish-token", "", "bearer token required to publish packages (empty = publish disabled)")
-	jsonLog := flag.Bool("json-log", true, "emit logs as JSON (set false for human-readable text)")
+	jsonLog      := flag.Bool("json-log", true, "emit logs as JSON (set false for human-readable text)")
 	flag.Parse()
 
 	// Configure structured logging for the whole process.
@@ -31,8 +31,6 @@ func main() {
 		logHandler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	}
 	slog.SetDefault(slog.New(logHandler))
-	// Also redirect the stdlib log package to slog so any third-party code
-	// that calls log.Printf is captured in the same structured stream.
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
 
@@ -49,6 +47,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Scan plugin packages.
 	slog.Info("scanning plugins", "plugin_root", absPluginRoot)
 	packages, err := source.Scan(absPluginRoot)
 	if err != nil {
@@ -57,13 +56,21 @@ func main() {
 	}
 	slog.Info("plugins loaded", "count", len(packages))
 	for _, pkg := range packages {
-		slog.Info("plugin",
-			"name", pkg.Name,
-			"version", pkg.Version,
-			"runtime", pkg.Runtime,
-			"category", pkg.Category,
-		)
+		slog.Info("plugin", "name", pkg.Name, "version", pkg.Version, "runtime", pkg.Runtime, "category", pkg.Category)
 	}
+
+	// Scan profile packages from the same root.
+	slog.Info("scanning profiles", "plugin_root", absPluginRoot)
+	profiles, err := source.ScanProfiles(absPluginRoot)
+	if err != nil {
+		slog.Error("scanning profiles", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("profiles loaded", "count", len(profiles))
+	for _, p := range profiles {
+		slog.Info("profile", "name", p.Name, "version", p.Version)
+	}
+
 	metrics.SetPackagesLoaded(len(packages))
 
 	if err := httpapi.EnsureDataDir(absDataDir); err != nil {
@@ -72,31 +79,43 @@ func main() {
 	}
 
 	baseURL := "http://" + *addr
-	slog.Info("warming artifacts", "data_dir", absDataDir)
+
+	// Warm plugin artifacts.
+	slog.Info("warming plugin artifacts", "data_dir", absDataDir)
 	artifacts, err := httpapi.WarmArtifacts(packages, absDataDir, baseURL)
 	if err != nil {
-		slog.Error("warming artifacts", "error", err)
+		slog.Error("warming plugin artifacts", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("artifacts ready", "count", len(artifacts))
+	slog.Info("plugin artifacts ready", "count", len(artifacts))
 
-	handler := httpapi.New("official", packages, artifacts, httpapi.ServerOptions{
+	// Warm profile artifacts.
+	slog.Info("warming profile artifacts", "data_dir", absDataDir)
+	profileArtifacts, err := httpapi.WarmProfileArtifacts(profiles, absDataDir, baseURL)
+	if err != nil {
+		slog.Error("warming profile artifacts", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("profile artifacts ready", "count", len(profileArtifacts))
+
+	handler := httpapi.New("official", packages, artifacts, profiles, profileArtifacts, httpapi.ServerOptions{
 		DataDir:      absDataDir,
 		BaseURL:      baseURL,
 		PublishToken: *publishToken,
 	})
 
-	publishEnabled := *publishToken != ""
 	slog.Info("server ready",
 		"addr", *addr,
 		"base_url", baseURL,
 		"plugin_root", absPluginRoot,
 		"packages", len(packages),
-		"publish_enabled", publishEnabled,
+		"profiles", len(profiles),
+		"publish_enabled", *publishToken != "",
 		"startup_ms", time.Since(startedAt).Milliseconds(),
 		"endpoints", []string{
 			baseURL + "/healthz",
 			baseURL + "/v1/index.json",
+			baseURL + "/v1/profiles/index.json",
 			baseURL + "/metrics",
 		},
 	)

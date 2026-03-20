@@ -17,14 +17,26 @@ func TestServerHealthAndIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	profiles, err := source.ScanProfiles(pluginRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dataDir := filepath.Join(t.TempDir(), "data")
 	artifacts, err := httpapi.WarmArtifacts(packages, dataDir, "http://example.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(httpapi.New("official", packages, artifacts))
+	profileArtifacts, err := httpapi.WarmProfileArtifacts(profiles, dataDir, "http://example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(httpapi.New("official", packages, artifacts, profiles, profileArtifacts, httpapi.ServerOptions{
+		BaseURL: "http://example.test",
+		DataDir: dataDir,
+	}))
 	defer server.Close()
 
+	// Health check includes package and profile counts.
 	resp, err := http.Get(server.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +46,7 @@ func TestServerHealthAndIndex(t *testing.T) {
 		t.Fatalf("unexpected health status: %d", resp.StatusCode)
 	}
 
+	// Plugin index.
 	resp, err = http.Get(server.URL + "/v1/index.json")
 	if err != nil {
 		t.Fatal(err)
@@ -52,5 +65,24 @@ func TestServerHealthAndIndex(t *testing.T) {
 	}
 	if len(payload.Packages) == 0 {
 		t.Fatal("expected packages in index")
+	}
+
+	// Profile index always returns a valid response (may be empty if no standalone profiles).
+	resp, err = http.Get(server.URL + "/v1/profiles/index.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected profile index status: %d", resp.StatusCode)
+	}
+	var profilePayload struct {
+		APIVersion string `json:"apiVersion"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&profilePayload); err != nil {
+		t.Fatal(err)
+	}
+	if profilePayload.APIVersion == "" {
+		t.Fatal("expected apiVersion in profile index")
 	}
 }

@@ -105,6 +105,60 @@ func BuildPackageMetadataMulti(recs []source.PackageRecord, arts []archive.Artif
 	return meta
 }
 
+// ─── Profile index types ────────────────────────────────────────────────────
+
+type ProfileIndex struct {
+	APIVersion  string          `json:"apiVersion"`
+	GeneratedAt time.Time       `json:"generatedAt"`
+	Profiles    []IndexProfile  `json:"profiles"`
+}
+
+type IndexProfile struct {
+	Name          string `json:"name"`
+	LatestVersion string `json:"latestVersion"`
+	Description   string `json:"description"`
+	Source        string `json:"source"`
+}
+
+type ProfileMetadata struct {
+	APIVersion  string                `json:"apiVersion"`
+	Name        string                `json:"name"`
+	Description string                `json:"description"`
+	Versions    []ProfileVersionEntry `json:"versions"`
+}
+
+type ProfileVersionEntry struct {
+	Version  string           `json:"version"`
+	Artifact archive.Artifact `json:"artifact"`
+}
+
+func BuildProfileIndex(profiles []source.ProfileRecord, sourceName string) ProfileIndex {
+	out := ProfileIndex{APIVersion: APIVersion, GeneratedAt: time.Now().UTC()}
+	for _, rec := range profiles {
+		out.Profiles = append(out.Profiles, IndexProfile{
+			Name:          rec.Name,
+			LatestVersion: rec.Version,
+			Description:   rec.Description,
+			Source:        sourceName,
+		})
+	}
+	return out
+}
+
+func BuildProfileMetadata(rec source.ProfileRecord, art archive.Artifact) ProfileMetadata {
+	return ProfileMetadata{
+		APIVersion:  APIVersion,
+		Name:        rec.Name,
+		Description: rec.Description,
+		Versions: []ProfileVersionEntry{{
+			Version:  rec.Version,
+			Artifact: art,
+		}},
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 func BuildVersionManifest(rec source.PackageRecord, art archive.Artifact) VersionManifest {
 	return VersionManifest{
 		APIVersion:  APIVersion,

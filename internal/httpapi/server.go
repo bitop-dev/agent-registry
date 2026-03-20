@@ -29,28 +29,36 @@ type Server struct {
 	BaseURL      string
 	PublishToken string // empty = publish disabled
 
-	mu        sync.RWMutex
-	packages  []source.PackageRecord
-	artifacts map[string]archive.Artifact
+	mu               sync.RWMutex
+	packages         []source.PackageRecord
+	artifacts        map[string]archive.Artifact
+	profiles         []source.ProfileRecord
+	profileArtifacts map[string]archive.Artifact
 }
 
 // New returns an http.Handler with all registry routes registered and
 // wrapped in structured-logging middleware.
-func New(sourceName string, packages []source.PackageRecord, artifacts map[string]archive.Artifact, opts ServerOptions) http.Handler {
+func New(sourceName string, packages []source.PackageRecord, artifacts map[string]archive.Artifact,
+	profiles []source.ProfileRecord, profileArtifacts map[string]archive.Artifact,
+	opts ServerOptions) http.Handler {
 	s := &Server{
-		SourceName:   sourceName,
-		DataDir:      opts.DataDir,
-		BaseURL:      opts.BaseURL,
-		PublishToken: opts.PublishToken,
-		packages:     packages,
-		artifacts:    artifacts,
+		SourceName:       sourceName,
+		DataDir:          opts.DataDir,
+		BaseURL:          opts.BaseURL,
+		PublishToken:     opts.PublishToken,
+		packages:         packages,
+		artifacts:        artifacts,
+		profiles:         profiles,
+		profileArtifacts: profileArtifacts,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/index.json", s.handleIndex)
-	mux.HandleFunc("/v1/packages", s.handlePublish) // POST only
+	mux.HandleFunc("/v1/packages", s.handlePublish)  // POST only
 	mux.HandleFunc("/v1/packages/", s.handlePackages)
-	mux.HandleFunc("/artifacts/", s.handleArtifacts)
+	mux.HandleFunc("/v1/profiles/index.json", s.handleProfileIndex)
+	mux.HandleFunc("/v1/profiles/", s.handleProfilePackages)
+	mux.HandleFunc("/artifacts/", s.handleArtifacts) // covers both plugins and profiles
 	mux.Handle("/metrics", metrics.Handler())
 
 	// Wrap the entire mux with wide-event logging middleware.
@@ -67,9 +75,10 @@ type ServerOptions struct {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "endpoint", "health")
 	s.mu.RLock()
-	count := len(s.packages)
+	pkgCount := len(s.packages)
+	profCount := len(s.profiles)
 	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "packages": count})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "packages": pkgCount, "profiles": profCount})
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -254,40 +263,98 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "endpoint", "artifact")
 
+	// Path is either /artifacts/{name}/{version}.tar.gz (plugin)
+	// or /artifacts/profiles/{name}/{version}.tar.gz (profile).
 	trimmed := strings.TrimPrefix(r.URL.Path, "/artifacts/")
 	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+
+	if len(parts) == 3 && parts[0] == "profiles" {
+		// Profile artifact.
+		name := parts[1]
+		version := strings.TrimSuffix(parts[2], ".tar.gz")
+		if !safeNameRe.MatchString(name) {
+			middleware.AddField(r.Context(), "error", "invalid profile name")
+			writeError(w, http.StatusBadRequest, "invalid profile name")
+			return
+		}
+		middleware.AddField(r.Context(), "profile", name)
+		middleware.AddField(r.Context(), "version", version)
+		art, err := s.lookupProfileArtifact(name, version)
+		if err != nil {
+			middleware.AddField(r.Context(), "error", "artifact not found")
+			writeError(w, http.StatusNotFound, "artifact not found")
+			return
+		}
+		middleware.AddField(r.Context(), "artifact_path", art.Path)
+		metrics.RecordArtifactDownload()
+		w.Header().Set("Content-Type", "application/gzip")
+		http.ServeFile(w, r, art.Path)
+		return
+	}
+
+	// Plugin artifact.
 	if len(parts) != 2 {
 		middleware.AddField(r.Context(), "error", "bad artifact path")
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
 	}
-
 	name := parts[0]
 	version := strings.TrimSuffix(parts[1], ".tar.gz")
-
 	if !safeNameRe.MatchString(name) {
 		middleware.AddField(r.Context(), "error", "invalid package name")
 		middleware.AddField(r.Context(), "package", name)
 		writeError(w, http.StatusBadRequest, "invalid package name")
 		return
 	}
-
 	middleware.AddField(r.Context(), "package", name)
 	middleware.AddField(r.Context(), "version", version)
-
-	rec, art, err := s.lookup(name)
-	if err != nil || version != rec.Version {
+	rec, art, err := s.lookupVersion(name, version)
+	if err != nil {
 		middleware.AddField(r.Context(), "error", "artifact not found")
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
 	}
-
 	middleware.AddField(r.Context(), "runtime", rec.Runtime)
 	middleware.AddField(r.Context(), "artifact_path", art.Path)
 	metrics.RecordArtifactDownload()
-
 	w.Header().Set("Content-Type", "application/gzip")
 	http.ServeFile(w, r, art.Path)
+}
+
+func (s *Server) handleProfileIndex(w http.ResponseWriter, r *http.Request) {
+	middleware.AddField(r.Context(), "endpoint", "profile_index")
+	s.mu.RLock()
+	profs := s.profiles
+	s.mu.RUnlock()
+	middleware.AddField(r.Context(), "profile_count", len(profs))
+	writeJSON(w, http.StatusOK, index.BuildProfileIndex(profs, s.SourceName))
+}
+
+func (s *Server) handleProfilePackages(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/v1/profiles/")
+	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		middleware.AddField(r.Context(), "endpoint", "profile_meta")
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+	name := strings.TrimSuffix(parts[0], ".json")
+	if !safeNameRe.MatchString(name) {
+		middleware.AddField(r.Context(), "endpoint", "profile_meta")
+		middleware.AddField(r.Context(), "error", "invalid profile name")
+		writeError(w, http.StatusBadRequest, "invalid profile name")
+		return
+	}
+	middleware.AddField(r.Context(), "profile", name)
+	middleware.AddField(r.Context(), "endpoint", "profile_meta")
+
+	rec, art, err := s.lookupProfile(name)
+	if err != nil {
+		middleware.AddField(r.Context(), "error", err.Error())
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, index.BuildProfileMetadata(rec, art))
 }
 
 // lookup returns the latest version of a package by name.
@@ -340,6 +407,45 @@ func (s *Server) allVersions(name string) ([]source.PackageRecord, []archive.Art
 		arts = append(arts, art)
 	}
 	return recs, arts
+}
+
+func (s *Server) lookupProfile(name string) (source.ProfileRecord, archive.Artifact, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, rec := range s.profiles {
+		if rec.Name != name {
+			continue
+		}
+		art, ok := s.profileArtifacts[rec.Name+"@"+rec.Version]
+		if !ok {
+			return source.ProfileRecord{}, archive.Artifact{}, errors.New("profile artifact missing")
+		}
+		return rec, art, nil
+	}
+	return source.ProfileRecord{}, archive.Artifact{}, errors.New("profile not found")
+}
+
+func (s *Server) lookupProfileArtifact(name, version string) (archive.Artifact, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := name + "@" + version
+	art, ok := s.profileArtifacts[key]
+	if !ok {
+		return archive.Artifact{}, errors.New("profile artifact not found")
+	}
+	return art, nil
+}
+
+func WarmProfileArtifacts(profiles []source.ProfileRecord, dataDir, baseURL string) (map[string]archive.Artifact, error) {
+	arts := make(map[string]archive.Artifact, len(profiles))
+	for _, rec := range profiles {
+		art, err := archive.EnsureDir(rec.Name, rec.Version, rec.Path, "profiles", dataDir, baseURL)
+		if err != nil {
+			return nil, err
+		}
+		arts[rec.Name+"@"+rec.Version] = art
+	}
+	return arts, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
