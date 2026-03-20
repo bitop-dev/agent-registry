@@ -159,10 +159,10 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 
 	// Update in-memory registry under write lock.
 	s.mu.Lock()
-	// Replace existing record for this name+version or append.
+	// Replace existing record for this name+version or append as new version.
 	replaced := false
 	for i, p := range s.packages {
-		if p.Name == rec.Name {
+		if p.Name == rec.Name && p.Version == rec.Version {
 			s.packages[i] = rec
 			replaced = true
 			break
@@ -229,7 +229,12 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 1 {
 		middleware.AddField(r.Context(), "endpoint", "package_meta")
-		writeJSON(w, http.StatusOK, index.BuildPackageMetadata(rec, art))
+		allRecs, allArts := s.allVersions(name)
+		if len(allRecs) == 0 {
+			writeJSON(w, http.StatusOK, index.BuildPackageMetadata(rec, art))
+		} else {
+			writeJSON(w, http.StatusOK, index.BuildPackageMetadataMulti(allRecs, allArts))
+		}
 		return
 	}
 
@@ -237,12 +242,13 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "version", version)
 	middleware.AddField(r.Context(), "endpoint", "version_manifest")
 
-	if version != rec.Version {
+	versionRec, versionArt, err := s.lookupVersion(name, version)
+	if err != nil {
 		middleware.AddField(r.Context(), "error", "version not found")
 		writeError(w, http.StatusNotFound, "version not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, index.BuildVersionManifest(rec, art))
+	writeJSON(w, http.StatusOK, index.BuildVersionManifest(versionRec, versionArt))
 }
 
 func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
@@ -284,20 +290,56 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, art.Path)
 }
 
+// lookup returns the latest version of a package by name.
 func (s *Server) lookup(name string) (source.PackageRecord, archive.Artifact, error) {
+	return s.lookupVersion(name, "")
+}
+
+// lookupVersion returns a specific version of a package, or the latest if version is empty.
+func (s *Server) lookupVersion(name, version string) (source.PackageRecord, archive.Artifact, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	var match *source.PackageRecord
+	for i := range s.packages {
+		rec := &s.packages[i]
+		if rec.Name != name {
+			continue
+		}
+		if version != "" && rec.Version != version {
+			continue
+		}
+		// If no specific version requested, take the first match (latest by convention).
+		match = rec
+		break
+	}
+	if match == nil {
+		return source.PackageRecord{}, archive.Artifact{}, errors.New("package not found")
+	}
+	art, ok := s.artifacts[match.Name+"@"+match.Version]
+	if !ok {
+		return source.PackageRecord{}, archive.Artifact{}, errors.New("artifact missing")
+	}
+	return *match, art, nil
+}
+
+// allVersions returns all versions of a package sorted newest first.
+func (s *Server) allVersions(name string) ([]source.PackageRecord, []archive.Artifact) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var recs []source.PackageRecord
+	var arts []archive.Artifact
 	for _, rec := range s.packages {
 		if rec.Name != name {
 			continue
 		}
 		art, ok := s.artifacts[rec.Name+"@"+rec.Version]
 		if !ok {
-			return source.PackageRecord{}, archive.Artifact{}, errors.New("artifact missing")
+			continue
 		}
-		return rec, art, nil
+		recs = append(recs, rec)
+		arts = append(arts, art)
 	}
-	return source.PackageRecord{}, archive.Artifact{}, errors.New("package not found")
+	return recs, arts
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -326,6 +368,4 @@ func EnsureDataDir(path string) error {
 	return os.MkdirAll(path, 0o755)
 }
 
-// SHA256File computes the hex SHA256 of a file — exposed for use in publish handler.
-// The real implementation is in archive but re-exported here for convenience.
-var _ = archive.SHA256File // ensure it's accessible
+

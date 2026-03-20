@@ -80,6 +80,31 @@ func BuildPackageMetadata(rec source.PackageRecord, art archive.Artifact) Packag
 	}
 }
 
+// BuildPackageMetadataMulti builds metadata including all available versions.
+func BuildPackageMetadataMulti(recs []source.PackageRecord, arts []archive.Artifact) PackageMetadata {
+	if len(recs) == 0 {
+		return PackageMetadata{APIVersion: APIVersion}
+	}
+	meta := PackageMetadata{
+		APIVersion:  APIVersion,
+		Name:        recs[0].Name,
+		Description: recs[0].Description,
+	}
+	for i, rec := range recs {
+		var art archive.Artifact
+		if i < len(arts) {
+			art = arts[i]
+		}
+		meta.Versions = append(meta.Versions, VersionSummary{
+			Version:   rec.Version,
+			Framework: rec.Framework,
+			Runtime:   rec.Runtime,
+			Artifact:  art,
+		})
+	}
+	return meta
+}
+
 func BuildVersionManifest(rec source.PackageRecord, art archive.Artifact) VersionManifest {
 	return VersionManifest{
 		APIVersion:  APIVersion,
