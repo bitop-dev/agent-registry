@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bitop-dev/agent-registry/internal/archive"
 	"github.com/bitop-dev/agent-registry/internal/index"
@@ -23,6 +24,15 @@ import (
 // Anything else is rejected to prevent path traversal or injection.
 var safeNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]*[a-z0-9]$`)
 
+// WorkerRecord represents a registered agent worker.
+type WorkerRecord struct {
+	URL          string   `json:"url"`
+	Profiles     []string `json:"profiles"`
+	Capabilities []string `json:"capabilities"`
+	RegisteredAt string   `json:"registeredAt"`
+	LastHeartbeat string  `json:"lastHeartbeat"`
+}
+
 type Server struct {
 	SourceName   string
 	DataDir      string
@@ -34,6 +44,7 @@ type Server struct {
 	artifacts        map[string]archive.Artifact
 	profiles         []source.ProfileRecord
 	profileArtifacts map[string]archive.Artifact
+	workers          []WorkerRecord
 }
 
 // New returns an http.Handler with all registry routes registered and
@@ -58,6 +69,7 @@ func New(sourceName string, packages []source.PackageRecord, artifacts map[strin
 	mux.HandleFunc("/v1/packages/", s.handlePackages)
 	mux.HandleFunc("/v1/profiles/index.json", s.handleProfileIndex)
 	mux.HandleFunc("/v1/profiles/", s.handleProfilePackages)
+	mux.HandleFunc("/v1/workers", s.handleWorkers) // GET + POST + DELETE
 	mux.HandleFunc("/artifacts/", s.handleArtifacts) // covers both plugins and profiles
 	mux.Handle("/metrics", metrics.Handler())
 
@@ -446,6 +458,116 @@ func WarmProfileArtifacts(profiles []source.ProfileRecord, dataDir, baseURL stri
 		arts[rec.Name+"@"+rec.Version] = art
 	}
 	return arts, nil
+}
+
+// handleWorkers manages worker registration, listing, and deregistration.
+func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
+	middleware.AddField(r.Context(), "endpoint", "workers")
+	switch r.Method {
+	case http.MethodGet:
+		// List workers, optionally filtered by capability.
+		capability := r.URL.Query().Get("capability")
+		profile := r.URL.Query().Get("profile")
+		s.mu.RLock()
+		var filtered []WorkerRecord
+		for _, wr := range s.workers {
+			if capability != "" {
+				found := false
+				for _, c := range wr.Capabilities {
+					if strings.EqualFold(c, capability) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+			if profile != "" {
+				found := false
+				for _, p := range wr.Profiles {
+					if strings.EqualFold(p, profile) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+			filtered = append(filtered, wr)
+		}
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"workers": filtered, "count": len(filtered)})
+
+	case http.MethodPost:
+		// Register or heartbeat a worker.
+		var req struct {
+			URL          string   `json:"url"`
+			Profiles     []string `json:"profiles"`
+			Capabilities []string `json:"capabilities"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if strings.TrimSpace(req.URL) == "" {
+			writeError(w, http.StatusBadRequest, "url is required")
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		s.mu.Lock()
+		updated := false
+		for i, wr := range s.workers {
+			if wr.URL == req.URL {
+				s.workers[i].Profiles = req.Profiles
+				s.workers[i].Capabilities = req.Capabilities
+				s.workers[i].LastHeartbeat = now
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			s.workers = append(s.workers, WorkerRecord{
+				URL:           req.URL,
+				Profiles:      req.Profiles,
+				Capabilities:  req.Capabilities,
+				RegisteredAt:  now,
+				LastHeartbeat: now,
+			})
+		}
+		total := len(s.workers)
+		s.mu.Unlock()
+		middleware.AddField(r.Context(), "worker_url", req.URL)
+		middleware.AddField(r.Context(), "worker_count", total)
+		writeJSON(w, http.StatusOK, map[string]any{"registered": true, "url": req.URL})
+
+	case http.MethodDelete:
+		// Deregister a worker.
+		workerURL := r.URL.Query().Get("url")
+		if workerURL == "" {
+			writeError(w, http.StatusBadRequest, "url query parameter is required")
+			return
+		}
+		s.mu.Lock()
+		removed := false
+		for i, wr := range s.workers {
+			if wr.URL == workerURL {
+				s.workers = append(s.workers[:i], s.workers[i+1:]...)
+				removed = true
+				break
+			}
+		}
+		s.mu.Unlock()
+		if !removed {
+			writeError(w, http.StatusNotFound, "worker not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deregistered": true, "url": workerURL})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
