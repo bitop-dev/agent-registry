@@ -67,6 +67,7 @@ func New(sourceName string, packages []source.PackageRecord, artifacts map[strin
 	mux.HandleFunc("/v1/index.json", s.handleIndex)
 	mux.HandleFunc("/v1/packages", s.handlePublish)  // POST only
 	mux.HandleFunc("/v1/packages/", s.handlePackages)
+	mux.HandleFunc("/v1/profiles", s.handleProfilePublish) // POST only
 	mux.HandleFunc("/v1/profiles/index.json", s.handleProfileIndex)
 	mux.HandleFunc("/v1/profiles/", s.handleProfilePackages)
 	mux.HandleFunc("/v1/workers", s.handleWorkers) // GET + POST + DELETE
@@ -331,6 +332,90 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordArtifactDownload()
 	w.Header().Set("Content-Type", "application/gzip")
 	http.ServeFile(w, r, art.Path)
+}
+
+func (s *Server) handleProfilePublish(w http.ResponseWriter, r *http.Request) {
+	middleware.AddField(r.Context(), "endpoint", "profile_publish")
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.PublishToken == "" {
+		writeError(w, http.StatusForbidden, "publish is disabled")
+		return
+	}
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if auth != s.PublishToken {
+		writeError(w, http.StatusUnauthorized, "invalid publish token")
+		return
+	}
+
+	tmp, err := os.CreateTemp("", "agent-profile-publish-*.tar.gz")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create temp file")
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, r.Body); err != nil {
+		tmp.Close()
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	tmp.Close()
+
+	rec, err := source.ScanProfileTarball(tmp.Name())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid profile tarball: %v", err))
+		return
+	}
+	middleware.AddField(r.Context(), "profile", rec.Name)
+	middleware.AddField(r.Context(), "version", rec.Version)
+
+	artifactPath := filepath.Join(s.DataDir, "artifacts", "profiles", rec.Name, rec.Version+".tar.gz")
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create artifact dir")
+		return
+	}
+	if err := os.Rename(tmp.Name(), artifactPath); err != nil {
+		if err2 := copyFile(tmp.Name(), artifactPath); err2 != nil {
+			writeError(w, http.StatusInternalServerError, "failed to store artifact")
+			return
+		}
+	}
+
+	checksum, err := archive.SHA256File(artifactPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to compute checksum")
+		return
+	}
+	art := archive.Artifact{
+		Type:   "tar.gz",
+		URL:    strings.TrimRight(s.BaseURL, "/") + "/artifacts/profiles/" + rec.Name + "/" + rec.Version + ".tar.gz",
+		SHA256: checksum,
+		Path:   artifactPath,
+	}
+	rec.Path = artifactPath
+
+	s.mu.Lock()
+	replaced := false
+	for i, p := range s.profiles {
+		if p.Name == rec.Name {
+			s.profiles[i] = rec
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.profiles = append(s.profiles, rec)
+	}
+	s.profileArtifacts[rec.Name+"@"+rec.Version] = art
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"name":    rec.Name,
+		"version": rec.Version,
+		"type":    "profile",
+	})
 }
 
 func (s *Server) handleProfileIndex(w http.ResponseWriter, r *http.Request) {

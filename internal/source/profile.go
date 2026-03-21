@@ -1,7 +1,10 @@
 package source
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,4 +67,50 @@ func ScanProfiles(root string) ([]ProfileRecord, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// ScanProfileTarball reads a .tar.gz and extracts metadata from its profile.yaml.
+func ScanProfileTarball(path string) (ProfileRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return ProfileRecord{}, err
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return ProfileRecord{}, fmt.Errorf("not a valid gzip file: %w", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return ProfileRecord{}, err
+		}
+		parts := strings.SplitN(filepath.ToSlash(hdr.Name), "/", 3)
+		if len(parts) != 2 || parts[1] != "profile.yaml" {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return ProfileRecord{}, err
+		}
+		var mf profileManifest
+		if err := yaml.Unmarshal(data, &mf); err != nil {
+			return ProfileRecord{}, fmt.Errorf("parse profile.yaml: %w", err)
+		}
+		if mf.Metadata.Name == "" || mf.Metadata.Version == "" {
+			return ProfileRecord{}, fmt.Errorf("profile.yaml missing name or version")
+		}
+		return ProfileRecord{
+			Name:        mf.Metadata.Name,
+			Version:     mf.Metadata.Version,
+			Description: mf.Metadata.Description,
+			Path:        path,
+		}, nil
+	}
+	return ProfileRecord{}, fmt.Errorf("profile.yaml not found in tarball")
 }
