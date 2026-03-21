@@ -44,6 +44,11 @@ type manifest struct {
 func Scan(root string) ([]PackageRecord, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Empty registry — no plugins yet. Create the directory for future publishes.
+			os.MkdirAll(root, 0o755)
+			return nil, nil
+		}
 		return nil, err
 	}
 	var out []PackageRecord
