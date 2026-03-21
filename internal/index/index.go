@@ -24,6 +24,7 @@ type IndexPackage struct {
 	Keywords      []string `json:"keywords"`
 	Tools         []string `json:"tools,omitempty"`
 	Dependencies  []string `json:"dependencies,omitempty"`
+	Downloads     int      `json:"downloads"`
 	Source        string   `json:"source"`
 }
 
@@ -129,6 +130,7 @@ type IndexProfile struct {
 	Model         string   `json:"model,omitempty"`
 	Provider      string   `json:"provider,omitempty"`
 	Tools         []string `json:"tools,omitempty"`
+	Downloads     int      `json:"downloads"`
 	Source        string   `json:"source"`
 }
 

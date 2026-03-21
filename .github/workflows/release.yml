@@ -27,6 +27,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build marketplace UI
+        run: |
+          cd marketplace
+          bun install --frozen-lockfile
+          bun run build
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

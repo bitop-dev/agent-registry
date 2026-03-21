@@ -1,8 +1,10 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"log/slog"
 	"net/http"
@@ -14,6 +16,9 @@ import (
 	"github.com/bitop-dev/agent-registry/internal/metrics"
 	"github.com/bitop-dev/agent-registry/internal/source"
 )
+
+//go:embed web
+var webContent embed.FS
 
 func main() {
 	addr         := flag.String("addr", "127.0.0.1:9080", "listen address")
@@ -102,10 +107,18 @@ func main() {
 	}
 	slog.Info("profile artifacts ready", "count", len(profileArtifacts))
 
+	// Marketplace web UI (embedded static files)
+	webFS, _ := fs.Sub(webContent, "web")
+	var webHandler http.Handler
+	if webFS != nil {
+		webHandler = http.FileServer(http.FS(webFS))
+	}
+
 	handler := httpapi.New("official", packages, artifacts, profiles, profileArtifacts, httpapi.ServerOptions{
 		DataDir:      absDataDir,
 		BaseURL:      baseURL,
 		PublishToken: *publishToken,
+		WebFS:        webHandler,
 	})
 
 	slog.Info("server ready",

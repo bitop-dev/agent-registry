@@ -13,11 +13,14 @@ import (
 	"sync"
 	"time"
 
+	"sort"
+
 	"github.com/bitop-dev/agent-registry/internal/archive"
 	"github.com/bitop-dev/agent-registry/internal/index"
 	"github.com/bitop-dev/agent-registry/internal/metrics"
 	"github.com/bitop-dev/agent-registry/internal/middleware"
 	"github.com/bitop-dev/agent-registry/internal/source"
+	"github.com/bitop-dev/agent-registry/internal/stats"
 )
 
 // safeNameRe matches valid package names: lowercase letters, digits, hyphens.
@@ -38,6 +41,7 @@ type Server struct {
 	DataDir      string
 	BaseURL      string
 	PublishToken string // empty = publish disabled
+	Stats        *stats.Store
 
 	mu               sync.RWMutex
 	packages         []source.PackageRecord
@@ -57,24 +61,47 @@ func New(sourceName string, packages []source.PackageRecord, artifacts map[strin
 		DataDir:          opts.DataDir,
 		BaseURL:          opts.BaseURL,
 		PublishToken:     opts.PublishToken,
+		Stats:            stats.NewStore(opts.DataDir),
 		packages:         packages,
 		artifacts:        artifacts,
 		profiles:         profiles,
 		profileArtifacts: profileArtifacts,
 	}
+
+	// Extract READMEs from existing artifacts
+	for _, pkg := range packages {
+		if readme := source.ExtractREADME(pkg.Path); readme != "" {
+			s.Stats.SetREADME("plugin", pkg.Name, readme)
+		}
+	}
+	for _, prof := range profiles {
+		if readme := source.ExtractREADME(prof.Path); readme != "" {
+			s.Stats.SetREADME("profile", prof.Name, readme)
+		}
+	}
+
+	// Start periodic stats flush (every 60s)
+	s.Stats.StartFlush(60 * time.Second)
+
 	mux := http.NewServeMux()
+
+	// Marketplace UI (static files embedded in binary)
+	if opts.WebFS != nil {
+		mux.Handle("/", opts.WebFS)
+	}
+
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/index.json", s.handleIndex)
-	mux.HandleFunc("/v1/packages", s.handlePublish)  // POST only
+	mux.HandleFunc("/v1/search", s.handleSearch)
+	mux.HandleFunc("/v1/packages", s.handlePublish) // POST only
 	mux.HandleFunc("/v1/packages/", s.handlePackages)
 	mux.HandleFunc("/v1/profiles", s.handleProfilePublish) // POST only
 	mux.HandleFunc("/v1/profiles/index.json", s.handleProfileIndex)
 	mux.HandleFunc("/v1/profiles/", s.handleProfilePackages)
 	mux.HandleFunc("/v1/workers", s.handleWorkers) // GET + POST + DELETE
-	mux.HandleFunc("/artifacts/", s.handleArtifacts) // covers both plugins and profiles
+	mux.HandleFunc("/artifacts/", s.handleArtifacts)
 	mux.Handle("/metrics", metrics.Handler())
 
-	// Wrap the entire mux with wide-event logging middleware.
 	return middleware.Logging(mux)
 }
 
@@ -82,7 +109,8 @@ func New(sourceName string, packages []source.PackageRecord, artifacts map[strin
 type ServerOptions struct {
 	DataDir      string
 	BaseURL      string
-	PublishToken string // if empty, publish endpoint is disabled
+	PublishToken string       // if empty, publish endpoint is disabled
+	WebFS        http.Handler // marketplace UI static files
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +129,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	middleware.AddField(r.Context(), "package_count", len(pkgs))
 	metrics.RecordIndexRequest()
-	writeJSON(w, http.StatusOK, index.BuildSearchIndex(pkgs, s.SourceName))
+	idx := index.BuildSearchIndex(pkgs, s.SourceName)
+	// Inject download counts
+	for i := range idx.Packages {
+		idx.Packages[i].Downloads = s.Stats.GetDownloads("plugin", idx.Packages[i].Name)
+	}
+	writeJSON(w, http.StatusOK, idx)
 }
 
 // handlePublish accepts POST /v1/packages with a raw .tar.gz body.
@@ -196,6 +229,11 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	s.artifacts[rec.Name+"@"+rec.Version] = art
 	s.mu.Unlock()
 
+	// Extract README
+	if readme := source.ExtractREADME(artifactPath); readme != "" {
+		s.Stats.SetREADME("plugin", rec.Name, readme)
+	}
+
 	metrics.SetPackagesLoaded(len(s.packages))
 	middleware.AddField(r.Context(), "replaced", replaced)
 	writeJSON(w, http.StatusCreated, index.BuildVersionManifest(rec, art))
@@ -250,6 +288,15 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "category", rec.Category)
 
 	if len(parts) == 1 {
+		// Check for detail.json suffix
+		if strings.HasSuffix(parts[0], "detail.json") {
+			detailName := strings.TrimSuffix(parts[0], ".detail.json")
+			if detailName == "" {
+				detailName = name
+			}
+			s.handleDetail(w, "plugin", detailName)
+			return
+		}
 		middleware.AddField(r.Context(), "endpoint", "package_meta")
 		allRecs, allArts := s.allVersions(name)
 		if len(allRecs) == 0 {
@@ -257,6 +304,12 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeJSON(w, http.StatusOK, index.BuildPackageMetadataMulti(allRecs, allArts))
 		}
+		return
+	}
+
+	// Handle /v1/packages/{name}/detail.json
+	if len(parts) == 2 && parts[1] == "detail.json" {
+		s.handleDetail(w, "plugin", name)
 		return
 	}
 
@@ -300,6 +353,7 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		}
 		middleware.AddField(r.Context(), "artifact_path", art.Path)
 		metrics.RecordArtifactDownload()
+		s.Stats.RecordDownload("profile", name)
 		w.Header().Set("Content-Type", "application/gzip")
 		http.ServeFile(w, r, art.Path)
 		return
@@ -330,6 +384,7 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 	middleware.AddField(r.Context(), "runtime", rec.Runtime)
 	middleware.AddField(r.Context(), "artifact_path", art.Path)
 	metrics.RecordArtifactDownload()
+	s.Stats.RecordDownload("plugin", name)
 	w.Header().Set("Content-Type", "application/gzip")
 	http.ServeFile(w, r, art.Path)
 }
@@ -411,6 +466,11 @@ func (s *Server) handleProfilePublish(w http.ResponseWriter, r *http.Request) {
 	s.profileArtifacts[rec.Name+"@"+rec.Version] = art
 	s.mu.Unlock()
 
+	// Extract README
+	if readme := source.ExtractREADME(artifactPath); readme != "" {
+		s.Stats.SetREADME("profile", rec.Name, readme)
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"name":    rec.Name,
 		"version": rec.Version,
@@ -424,7 +484,12 @@ func (s *Server) handleProfileIndex(w http.ResponseWriter, r *http.Request) {
 	profs := s.profiles
 	s.mu.RUnlock()
 	middleware.AddField(r.Context(), "profile_count", len(profs))
-	writeJSON(w, http.StatusOK, index.BuildProfileIndex(profs, s.SourceName))
+	idx := index.BuildProfileIndex(profs, s.SourceName)
+	// Inject download counts
+	for i := range idx.Profiles {
+		idx.Profiles[i].Downloads = s.Stats.GetDownloads("profile", idx.Profiles[i].Name)
+	}
+	writeJSON(w, http.StatusOK, idx)
 }
 
 func (s *Server) handleProfilePackages(w http.ResponseWriter, r *http.Request) {
@@ -443,8 +508,14 @@ func (s *Server) handleProfilePackages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	middleware.AddField(r.Context(), "profile", name)
-	middleware.AddField(r.Context(), "endpoint", "profile_meta")
 
+	// Handle /v1/profiles/{name}/detail.json
+	if len(parts) == 2 && parts[1] == "detail.json" {
+		s.handleDetail(w, "profile", name)
+		return
+	}
+
+	middleware.AddField(r.Context(), "endpoint", "profile_meta")
 	rec, art, err := s.lookupProfile(name)
 	if err != nil {
 		middleware.AddField(r.Context(), "error", err.Error())
@@ -652,6 +723,170 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// handleSearch provides full-text search across plugins and profiles.
+// GET /v1/search?q=grafana&type=plugin&category=integration&sort=downloads
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	middleware.AddField(r.Context(), "endpoint", "search")
+	q := strings.ToLower(r.URL.Query().Get("q"))
+	filterType := r.URL.Query().Get("type")       // "plugin", "profile", or "" (both)
+	filterCat := r.URL.Query().Get("category")     // filter by category
+	filterRuntime := r.URL.Query().Get("runtime")  // filter by runtime
+	sortBy := r.URL.Query().Get("sort")            // "downloads", "name", "" (default: name)
+
+	type searchResult struct {
+		Name        string   `json:"name"`
+		Type        string   `json:"type"` // "plugin" or "profile"
+		Version     string   `json:"version"`
+		Description string   `json:"description"`
+		Category    string   `json:"category,omitempty"`
+		Runtime     string   `json:"runtime,omitempty"`
+		Tools       []string `json:"tools,omitempty"`
+		Downloads   int      `json:"downloads"`
+		// Profile-specific
+		Capabilities []string `json:"capabilities,omitempty"`
+		Model        string   `json:"model,omitempty"`
+		Extends      string   `json:"extends,omitempty"`
+	}
+
+	var results []searchResult
+
+	s.mu.RLock()
+	if filterType != "profile" {
+		for _, pkg := range s.packages {
+			if !matchesSearch(q, pkg.Name, pkg.Description, pkg.Keywords) {
+				continue
+			}
+			if filterCat != "" && !strings.EqualFold(pkg.Category, filterCat) {
+				continue
+			}
+			if filterRuntime != "" && !strings.EqualFold(pkg.Runtime, filterRuntime) {
+				continue
+			}
+			results = append(results, searchResult{
+				Name:        pkg.Name,
+				Type:        "plugin",
+				Version:     pkg.Version,
+				Description: pkg.Description,
+				Category:    pkg.Category,
+				Runtime:     pkg.Runtime,
+				Tools:       pkg.Tools,
+				Downloads:   s.Stats.GetDownloads("plugin", pkg.Name),
+			})
+		}
+	}
+	if filterType != "plugin" {
+		for _, prof := range s.profiles {
+			if !matchesSearch(q, prof.Name, prof.Description, prof.Capabilities) {
+				continue
+			}
+			results = append(results, searchResult{
+				Name:         prof.Name,
+				Type:         "profile",
+				Version:      prof.Version,
+				Description:  prof.Description,
+				Capabilities: prof.Capabilities,
+				Model:        prof.Model,
+				Extends:      prof.Extends,
+				Downloads:    s.Stats.GetDownloads("profile", prof.Name),
+			})
+		}
+	}
+	s.mu.RUnlock()
+
+	// Sort
+	switch sortBy {
+	case "downloads":
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Downloads > results[j].Downloads
+		})
+	default:
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Name < results[j].Name
+		})
+	}
+
+	middleware.AddField(r.Context(), "query", q)
+	middleware.AddField(r.Context(), "results", len(results))
+	writeJSON(w, http.StatusOK, map[string]any{"results": results, "count": len(results), "query": q})
+}
+
+func matchesSearch(query string, fields ...interface{}) bool {
+	if query == "" {
+		return true // empty query matches all
+	}
+	for _, f := range fields {
+		switch v := f.(type) {
+		case string:
+			if strings.Contains(strings.ToLower(v), query) {
+				return true
+			}
+		case []string:
+			for _, s := range v {
+				if strings.Contains(strings.ToLower(s), query) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// handleDetail returns full info about a plugin or profile including README.
+func (s *Server) handleDetail(w http.ResponseWriter, kind, name string) {
+	readme := s.Stats.GetREADME(kind, name)
+	downloads := s.Stats.GetDownloads(kind, name)
+
+	if kind == "plugin" {
+		rec, _, err := s.lookup(name)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "plugin not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":         rec.Name,
+			"type":         "plugin",
+			"version":      rec.Version,
+			"description":  rec.Description,
+			"category":     rec.Category,
+			"runtime":      rec.Runtime,
+			"tools":        rec.Tools,
+			"dependencies": rec.Dependencies,
+			"downloads":    downloads,
+			"readme":       readme,
+		})
+	} else {
+		s.mu.RLock()
+		var found *source.ProfileRecord
+		for i := range s.profiles {
+			if s.profiles[i].Name == name {
+				found = &s.profiles[i]
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if found == nil {
+			writeError(w, http.StatusNotFound, "profile not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":         found.Name,
+			"type":         "profile",
+			"version":      found.Version,
+			"description":  found.Description,
+			"capabilities": found.Capabilities,
+			"accepts":      found.Accepts,
+			"returns":      found.Returns,
+			"extends":      found.Extends,
+			"mode":         found.Mode,
+			"model":        found.Model,
+			"provider":     found.Provider,
+			"tools":        found.Tools,
+			"downloads":    downloads,
+			"readme":       readme,
+		})
 	}
 }
 
