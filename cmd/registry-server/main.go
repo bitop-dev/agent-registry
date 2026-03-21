@@ -17,6 +17,7 @@ import (
 
 func main() {
 	addr         := flag.String("addr", "127.0.0.1:9080", "listen address")
+	baseURLFlag  := flag.String("base-url", "", "public base URL for artifact download links (default: http://<addr>)")
 	pluginRoot   := flag.String("plugin-root", "../agent-plugins", "path to plugin package root (also scanned for profile packages)")
 	dataDir      := flag.String("data-dir", "./data", "path to generated registry data")
 	publishToken := flag.String("publish-token", "", "bearer token required to publish packages (empty = publish disabled)")
@@ -78,7 +79,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	baseURL := "http://" + *addr
+	baseURL := *baseURLFlag
+	if baseURL == "" {
+		baseURL = "http://" + *addr
+	}
 
 	// Warm plugin artifacts.
 	slog.Info("warming plugin artifacts", "data_dir", absDataDir)
