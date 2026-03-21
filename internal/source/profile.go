@@ -15,18 +15,40 @@ import (
 
 // ProfileRecord holds the normalized metadata for one profile package.
 type ProfileRecord struct {
-	Name        string
-	Version     string
-	Description string
-	Path        string
+	Name         string
+	Version      string
+	Description  string
+	Path         string
+	Capabilities []string
+	Accepts      string
+	Returns      string
+	Extends      string
+	Mode         string
+	Model        string
+	Provider     string
+	Tools        []string
 }
 
 type profileManifest struct {
 	Metadata struct {
-		Name        string `yaml:"name"`
-		Version     string `yaml:"version"`
-		Description string `yaml:"description"`
+		Name         string   `yaml:"name"`
+		Version      string   `yaml:"version"`
+		Description  string   `yaml:"description"`
+		Capabilities []string `yaml:"capabilities"`
+		Accepts      string   `yaml:"accepts"`
+		Returns      string   `yaml:"returns"`
+		Extends      string   `yaml:"extends"`
 	} `yaml:"metadata"`
+	Spec struct {
+		Mode     string `yaml:"mode"`
+		Provider struct {
+			Default string `yaml:"default"`
+			Model   string `yaml:"model"`
+		} `yaml:"provider"`
+		Tools struct {
+			Enabled []string `yaml:"enabled"`
+		} `yaml:"tools"`
+	} `yaml:"spec"`
 }
 
 // ScanProfiles walks root and returns one ProfileRecord per directory that
@@ -59,10 +81,18 @@ func ScanProfiles(root string) ([]ProfileRecord, error) {
 			continue // not a valid profile package
 		}
 		out = append(out, ProfileRecord{
-			Name:        mf.Metadata.Name,
-			Version:     mf.Metadata.Version,
-			Description: mf.Metadata.Description,
-			Path:        profileDir,
+			Name:         mf.Metadata.Name,
+			Version:      mf.Metadata.Version,
+			Description:  mf.Metadata.Description,
+			Path:         profileDir,
+			Capabilities: mf.Metadata.Capabilities,
+			Accepts:      mf.Metadata.Accepts,
+			Returns:      mf.Metadata.Returns,
+			Extends:      mf.Metadata.Extends,
+			Mode:         mf.Spec.Mode,
+			Model:        mf.Spec.Provider.Model,
+			Provider:     mf.Spec.Provider.Default,
+			Tools:        mf.Spec.Tools.Enabled,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -106,10 +136,18 @@ func ScanProfileTarball(path string) (ProfileRecord, error) {
 			return ProfileRecord{}, fmt.Errorf("profile.yaml missing name or version")
 		}
 		return ProfileRecord{
-			Name:        mf.Metadata.Name,
-			Version:     mf.Metadata.Version,
-			Description: mf.Metadata.Description,
-			Path:        path,
+			Name:         mf.Metadata.Name,
+			Version:      mf.Metadata.Version,
+			Description:  mf.Metadata.Description,
+			Path:         path,
+			Capabilities: mf.Metadata.Capabilities,
+			Accepts:      mf.Metadata.Accepts,
+			Returns:      mf.Metadata.Returns,
+			Extends:      mf.Metadata.Extends,
+			Mode:         mf.Spec.Mode,
+			Model:        mf.Spec.Provider.Model,
+			Provider:     mf.Spec.Provider.Default,
+			Tools:        mf.Spec.Tools.Enabled,
 		}, nil
 	}
 	return ProfileRecord{}, fmt.Errorf("profile.yaml not found in tarball")

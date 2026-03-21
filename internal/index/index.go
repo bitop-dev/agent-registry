@@ -22,6 +22,8 @@ type IndexPackage struct {
 	Category      string   `json:"category"`
 	Runtime       string   `json:"runtime"`
 	Keywords      []string `json:"keywords"`
+	Tools         []string `json:"tools,omitempty"`
+	Dependencies  []string `json:"dependencies,omitempty"`
 	Source        string   `json:"source"`
 }
 
@@ -60,6 +62,8 @@ func BuildSearchIndex(packages []source.PackageRecord, sourceName string) Search
 			Category:      rec.Category,
 			Runtime:       rec.Runtime,
 			Keywords:      rec.Keywords,
+			Tools:         rec.Tools,
+			Dependencies:  rec.Dependencies,
 			Source:        sourceName,
 		})
 	}
@@ -114,10 +118,18 @@ type ProfileIndex struct {
 }
 
 type IndexProfile struct {
-	Name          string `json:"name"`
-	LatestVersion string `json:"latestVersion"`
-	Description   string `json:"description"`
-	Source        string `json:"source"`
+	Name          string   `json:"name"`
+	LatestVersion string   `json:"latestVersion"`
+	Description   string   `json:"description"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	Accepts       string   `json:"accepts,omitempty"`
+	Returns       string   `json:"returns,omitempty"`
+	Extends       string   `json:"extends,omitempty"`
+	Mode          string   `json:"mode,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	Provider      string   `json:"provider,omitempty"`
+	Tools         []string `json:"tools,omitempty"`
+	Source        string   `json:"source"`
 }
 
 type ProfileMetadata struct {
@@ -139,6 +151,14 @@ func BuildProfileIndex(profiles []source.ProfileRecord, sourceName string) Profi
 			Name:          rec.Name,
 			LatestVersion: rec.Version,
 			Description:   rec.Description,
+			Capabilities:  rec.Capabilities,
+			Accepts:       rec.Accepts,
+			Returns:       rec.Returns,
+			Extends:       rec.Extends,
+			Mode:          rec.Mode,
+			Model:         rec.Model,
+			Provider:      rec.Provider,
+			Tools:         rec.Tools,
 			Source:        sourceName,
 		})
 	}

@@ -14,14 +14,16 @@ import (
 )
 
 type PackageRecord struct {
-	Name        string
-	Version     string
-	Description string
-	Category    string
-	Runtime     string
-	Framework   string
-	Path        string
-	Keywords    []string
+	Name         string
+	Version      string
+	Description  string
+	Category     string
+	Runtime      string
+	Framework    string
+	Path         string
+	Keywords     []string
+	Tools        []string
+	Dependencies []string
 }
 
 type manifest struct {
@@ -35,8 +37,14 @@ type manifest struct {
 		Runtime  struct {
 			Type string `yaml:"type"`
 		} `yaml:"runtime"`
+		Contributes struct {
+			Tools []struct {
+				ID string `yaml:"id"`
+			} `yaml:"tools"`
+		} `yaml:"contributes"`
 		Requires struct {
-			Framework string `yaml:"framework"`
+			Framework string   `yaml:"framework"`
+			Plugins   []string `yaml:"plugins"`
 		} `yaml:"requires"`
 	} `yaml:"spec"`
 }
@@ -87,15 +95,23 @@ func toRecord(path string, mf manifest) (PackageRecord, error) {
 	for _, part := range strings.Fields(strings.ToLower(strings.ReplaceAll(mf.Metadata.Description, "/", " "))) {
 		baseKeywords = append(baseKeywords, part)
 	}
+	var tools []string
+	for _, t := range mf.Spec.Contributes.Tools {
+		if t.ID != "" {
+			tools = append(tools, t.ID)
+		}
+	}
 	return PackageRecord{
-		Name:        mf.Metadata.Name,
-		Version:     mf.Metadata.Version,
-		Description: mf.Metadata.Description,
-		Category:    mf.Spec.Category,
-		Runtime:     mf.Spec.Runtime.Type,
-		Framework:   mf.Spec.Requires.Framework,
-		Path:        path,
-		Keywords:    unique(baseKeywords),
+		Name:         mf.Metadata.Name,
+		Version:      mf.Metadata.Version,
+		Description:  mf.Metadata.Description,
+		Category:     mf.Spec.Category,
+		Runtime:      mf.Spec.Runtime.Type,
+		Framework:    mf.Spec.Requires.Framework,
+		Path:         path,
+		Keywords:     unique(baseKeywords),
+		Tools:        tools,
+		Dependencies: mf.Spec.Requires.Plugins,
 	}, nil
 }
 
